@@ -1,6 +1,7 @@
 # ============================================
 # PROJETO 3 — AGENTE DE RH COM RAG + RERANKING
 # LangChain + Streamlit
+# LM Studio (Gemma) + Embeddings Locais
 # ============================================
 
 # =========================
@@ -10,20 +11,24 @@
 import os
 import streamlit as st
 
-# Injeta a chave como variável de ambiente
-
 # Loaders e chunking
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-# Embeddings e LLM
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+# LLM via LM Studio (OpenAI-compatible)
+from langchain_openai import ChatOpenAI
 
-# Vector Store
-from langchain_community.vectorstores import Chroma
+# Vector Store (use o wrapper novo)
+from langchain_chroma import Chroma
 
 # Prompt
 from langchain_core.prompts import PromptTemplate
+
+# Embeddings locais (sem OpenAI / sem LM Studio)
+from sentence_transformers import SentenceTransformer
+
+# Para reconstruir Document após query manual no Chroma
+from langchain_core.documents import Document
 
 
 # =========================
@@ -33,11 +38,13 @@ from langchain_core.prompts import PromptTemplate
 # Diretório do banco vetorial
 PERSIST_DIRECTORY = "./chroma_rh"
 
-# Modelo de embeddings
-EMBEDDING_MODEL = "text-embedding-3-small"
+# Embeddings locais (modelo leve e bom)
+LOCAL_EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"  # 384 dims
 
-# Modelo de linguagem
-LLM_MODEL = "gpt-4o-mini"
+# LLM local (LM Studio)
+LLM_MODEL = "google/gemma-3-1b"
+LMSTUDIO_BASE_URL = "http://127.0.0.1:1234/v1"
+
 
 # =========================
 # 3. LEITURA DOS DOCUMENTOS
@@ -67,6 +74,7 @@ def carregar_documentos():
 
     return documentos
 
+
 # =========================
 # 4. CHUNKING
 # =========================
@@ -81,6 +89,7 @@ def gerar_chunks(documentos):
     )
 
     return splitter.split_documents(documentos)
+
 
 # =========================
 # 5. ENRIQUECIMENTO COM METADADOS
@@ -104,25 +113,39 @@ def enriquecer_chunks(chunks):
 
     return chunks
 
+
 # =========================
-# 6. VECTOR STORE
+# 6. VECTOR STORE (EMBEDDINGS LOCAIS)
 # =========================
 
 @st.cache_resource
 def criar_vectorstore(_chunks):
     """
     Cria ou carrega o banco vetorial.
-    O parâmetro _chunks não entra no hash do cache.
+    Indexa usando embeddings locais (sentence-transformers).
     """
-    embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL)
+    embedder = SentenceTransformer(LOCAL_EMBED_MODEL)
 
-    vectorstore = Chroma.from_documents(
-        documents=_chunks,
-        embedding=embeddings,
+    texts = [d.page_content for d in _chunks]
+    metadatas = [d.metadata for d in _chunks]
+
+    vectors = embedder.encode(texts, normalize_embeddings=True).tolist()
+
+    vectorstore = Chroma(
+        collection_name="rh_policies",
         persist_directory=PERSIST_DIRECTORY
     )
 
+    # Adiciona tudo (IDs estáveis por índice)
+    vectorstore._collection.add(
+        ids=[str(i) for i in range(len(texts))],
+        documents=texts,
+        metadatas=metadatas,
+        embeddings=vectors
+    )
+
     return vectorstore
+
 
 # =========================
 # 7. RERANKING (PARTE CHAVE!)
@@ -133,7 +156,6 @@ def rerank_documentos(pergunta, documentos, llm):
     Reordena os documentos recuperados com base na relevância
     usando o próprio LLM (reranking semântico)
     """
-
     prompt_rerank = PromptTemplate(
         input_variables=["pergunta", "texto"],
         template="""
@@ -161,21 +183,20 @@ Responda apenas com um número de 0 a 10.
         ).content
 
         try:
-            score = float(score)
+            score = float(score.strip())
         except:
-            score = 0
+            score = 0.0
 
         documentos_com_score.append((score, doc))
 
-    # Ordena do mais relevante para o menos relevante
     documentos_ordenados = sorted(
         documentos_com_score,
         key=lambda x: x[0],
         reverse=True
     )
 
-    # Retorna apenas os documentos
     return [doc for _, doc in documentos_ordenados]
+
 
 # =========================
 # 8. PIPELINE RAG COMPLETO
@@ -184,22 +205,33 @@ Responda apenas com um número de 0 a 10.
 def responder_pergunta(pergunta, vectorstore):
     """
     Pipeline completo:
-    - Recuperação
+    - Recuperação (query manual no Chroma)
     - Reranking
     - Geração de resposta
     """
 
-    # LLM
+    # LLM local via LM Studio
     llm = ChatOpenAI(
         model=LLM_MODEL,
+        base_url=LMSTUDIO_BASE_URL,
+        api_key="lm-studio",  # qualquer string
         temperature=0
     )
 
-    # Recuperação inicial (top-k mais alto)
-    documentos_recuperados = vectorstore.similarity_search(
-        pergunta,
-        k=8
+    # Recuperação inicial usando embeddings locais (mesmo do índice)
+    embedder = SentenceTransformer(LOCAL_EMBED_MODEL)
+    qvec = embedder.encode(pergunta, normalize_embeddings=True).tolist()
+
+    res = vectorstore._collection.query(
+        query_embeddings=[qvec],
+        n_results=8,
+        include=["documents", "metadatas"]
     )
+
+    documentos_recuperados = [
+        Document(page_content=txt, metadata=meta)
+        for txt, meta in zip(res["documents"][0], res["metadatas"][0])
+    ]
 
     # Reranking
     documentos_rerankeados = rerank_documentos(
@@ -212,9 +244,7 @@ def responder_pergunta(pergunta, vectorstore):
     contexto_final = documentos_rerankeados[:4]
 
     # Prompt final
-    contexto_texto = "\n\n".join(
-        [doc.page_content for doc in contexto_final]
-    )
+    contexto_texto = "\n\n".join([doc.page_content for doc in contexto_final])
 
     prompt_final = f"""
 Você é um agente de RH corporativo.
@@ -231,12 +261,13 @@ Pergunta:
 
     return resposta.content, contexto_final
 
+
 # =========================
 # 9. INTERFACE STREAMLIT
 # =========================
 
 st.set_page_config(page_title="Agente de RH com RAG", layout="wide")
-st.title("🤖 Agente de RH — Políticas Internas")
+st.title("🤖 Agente de RH — Políticas Internas (LM Studio)")
 
 pergunta = st.text_input("Digite sua pergunta sobre políticas internas de RH:")
 
@@ -261,8 +292,7 @@ if pergunta:
         st.divider()
 
 
-## Quais são as regras para concessão de férias aos colaboradores?
-
-## Quem pode trabalhar em regime de home office e quais são as condições?
-
-## Quais comportamentos são considerados inadequados segundo o código de conduta da empresa?
+# Exemplos:
+# Quais são as regras para concessão de férias aos colaboradores?
+# Quem pode trabalhar em regime de home office e quais são as condições?
+# Quais comportamentos são considerados inadequados segundo o código de conduta da empresa?
