@@ -56,9 +56,9 @@ def carregar_documentos():
     Carrega os PDFs de políticas internas de RH
     """
     caminhos = [
-        "politica_ferias.pdf",
-        "politica_home_office.pdf",
-        "codigo_conduta.pdf"
+        "C:\Users\Administrador\OneDrive\Documentos\Profissional\Alura\2_Engenharia_IA\Arq_RAG\PDFs\Office policies\codigo_conduta.pdf",
+        "C:\Users\Administrador\OneDrive\Documentos\Profissional\Alura\2_Engenharia_IA\Arq_RAG\PDFs\Office policies\politica_home_office.pdf",
+        "C:\Users\Administrador\OneDrive\Documentos\Profissional\Alura\2_Engenharia_IA\Arq_RAG\PDFs\Office policies\codigo_conduta.pdf"
     ]
 
     documentos = []
